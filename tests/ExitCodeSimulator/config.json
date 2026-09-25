@@ -1,0 +1,11 @@
+{
+  "display_name": "Exit Code Simulator",
+  "publisher": "IntuneWinTester Test Fixture",
+  "install_type": "user",
+  "install_command": ".\\Simulate-Install.ps1 -ExitCode 60010",
+  "uninstall_command": ".\\Simulate-Uninstall.ps1 -ExitCode 3010",
+  "detection_rule": "Simulate-Detect.ps1",
+  "major_version": "1",
+  "minor_version": "0",
+  "restart": "false"
+}
