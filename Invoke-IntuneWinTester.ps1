@@ -34,6 +34,14 @@
 .PARAMETER Force
     Re-decrypt even if the source file hash matches the cached hash.
 
+.PARAMETER IgnoreReturnCodes
+    By default, Install/Uninstall results recognize the standard Intune Win32
+    return codes (0/1707 Success, 3010 Soft Reboot, 1641 Hard Reboot, 1618 Retry)
+    and show an informative message instead of FAILED — matching how IME
+    classifies them (none of these trigger an actual reboot or retry in this
+    tester). Pass -IgnoreReturnCodes to disable this and compare strictly
+    against -ExpectedExit (default 0) instead.
+
 .EXAMPLE
     .\Invoke-IntuneWinTester.ps1 -IntuneWinFile .\MyApp.intunewin
 
@@ -81,7 +89,10 @@ param(
     [string]$PsExecPath = '',
 
     [Parameter(Mandatory = $false)]
-    [switch]$Force
+    [switch]$Force,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$IgnoreReturnCodes
 )
 
 Set-StrictMode -Version Latest
@@ -475,14 +486,28 @@ if ($appConfig) {
     $ic      = $appConfig.install_command   -replace "'", "''"
     $uc      = $appConfig.uninstall_command -replace "'", "''"
     $dr      = $appConfig.detection_rule   -replace "'", "''"
-    $pub     = if ($appConfig.publisher)     { $appConfig.publisher -replace "'","''" } else { $null }
-    $restart = if ($appConfig.restart)       { $appConfig.restart   -replace "'","''" } else { $null }
+    # Optional fields may be absent from config.json entirely — under StrictMode,
+    # $appConfig.<name> throws "property cannot be found" rather than returning $null,
+    # so probe with PSObject.Properties first.
+    $getOpt = {
+        param($Name)
+        if ($appConfig.PSObject.Properties[$Name]) { $appConfig.PSObject.Properties[$Name].Value } else { $null }
+    }
+
+    $pubRaw     = & $getOpt 'publisher'
+    $restartRaw = & $getOpt 'restart'
+    $majorRaw   = & $getOpt 'major_version'
+    $minorRaw   = & $getOpt 'minor_version'
+    $hotfixRaw  = & $getOpt 'hotfix'
+
+    $pub     = if ($pubRaw)     { $pubRaw     -replace "'","''" } else { $null }
+    $restart = if ($restartRaw) { $restartRaw -replace "'","''" } else { $null }
 
     $ver = $null
-    if ($appConfig.major_version) {
-        $ver = $appConfig.major_version
-        if ($appConfig.minor_version) { $ver += ".$($appConfig.minor_version)" }
-        if ($appConfig.hotfix)        { $ver += ".$($appConfig.hotfix)" }
+    if ($majorRaw) {
+        $ver = $majorRaw
+        if ($minorRaw)  { $ver += ".$minorRaw" }
+        if ($hotfixRaw) { $ver += ".$hotfixRaw" }
     }
 
     # Prefix plain filenames with .\ so they run from the extracted folder
@@ -526,6 +551,21 @@ if ($appConfig) {
     $initLines.Add("`$script:_ic = '$ic'")
     $initLines.Add("`$script:_uc = '$uc'")
     $initLines.Add("`$script:_dr = '$drCall'")
+    $initLines.Add("`$script:_ignoreReturnCodes = `$$($IgnoreReturnCodes.IsPresent)")
+
+    #-- Standard Intune Win32 return-code table (single-quoted: static) -----
+    # Matches the default return codes shown in the Intune admin center when adding
+    # a Win32 app. None of these trigger an actual reboot or retry in this tester —
+    # they're surfaced as informative messages instead, mirroring how IME classifies them.
+    $initLines.Add(@'
+$script:_returnCodes = @{
+    0    = 'Success'
+    1707 = 'Success'
+    3010 = 'SoftReboot'
+    1641 = 'HardReboot'
+    1618 = 'Retry'
+}
+'@)
 
     #-- Process-tree wait helper (single-quoted) ----------------------------
     # Win32_Process.ParentProcessId is set at spawn time and is not cleared when
@@ -538,6 +578,7 @@ function Wait-ProcessTree {
     $spinner   = [char[]]@('|', '/', '-', '\')
     $spinIdx   = 0
     $startTime = [datetime]::UtcNow
+    $lineDrawn = $false
     do {
         Start-Sleep -Milliseconds $PollMs
         $visited = [System.Collections.Generic.HashSet[int]]::new()
@@ -557,6 +598,9 @@ function Wait-ProcessTree {
             catch { $false }
         })
         if ($alive.Count -gt 0) {
+            # Clamp to the console width so the line never wraps — a wrapped line
+            # leaves stray characters behind on the next row when cleared with just '\r'.
+            $width = try { [Math]::Max(20, $Host.UI.RawUI.WindowSize.Width - 1) } catch { 79 }
             $elapsed = [int]([datetime]::UtcNow - $startTime).TotalSeconds
             $spin    = $spinner[$spinIdx % $spinner.Length]
             $spinIdx++
@@ -565,41 +609,154 @@ function Wait-ProcessTree {
                 catch { "PID $_" }
             } | Select-Object -First 3)
             $nameStr = $names -join '  '
-            $padded  = "  [~] Waiting $spin  $nameStr  (${elapsed}s)".PadRight(80)
-            Write-Host "`r$padded" -NoNewline -ForegroundColor DarkGray
+            $line    = "  [~] Waiting $spin  $nameStr  (${elapsed}s)"
+            if ($line.Length -gt $width) { $line = $line.Substring(0, $width - 1) + '…' }
+            $lineDrawn = $true
+            Write-Host ("`r" + $line.PadRight($width)) -NoNewline -ForegroundColor DarkGray
         }
     } while ($alive.Count -gt 0)
-    Write-Host ("`r" + ' ' * 80 + "`r") -NoNewline
+    if ($lineDrawn) {
+        $width = try { [Math]::Max(20, $Host.UI.RawUI.WindowSize.Width - 1) } catch { 79 }
+        Write-Host ("`r" + (' ' * $width) + "`r") -NoNewline
+    }
+}
+'@)
+
+    #-- Live-streamed process runner (single-quoted) -------------------------
+    # Redirects stdout/stderr and prints each line with the same "  │ " left
+    # margin used for captured detection output, so live and captured text
+    # share one visual language instead of streamed text breaking to column 0.
+    $initLines.Add(@'
+function Start-IndentedProcess {
+    param([string]$FilePath, [string]$Arguments, [string]$WorkingDirectory)
+
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $FilePath
+    if ($Arguments)        { $psi.Arguments        = $Arguments }
+    if ($WorkingDirectory) { $psi.WorkingDirectory = $WorkingDirectory }
+    $psi.UseShellExecute        = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError  = $true
+
+    $proc                     = [System.Diagnostics.Process]::new()
+    $proc.StartInfo           = $psi
+    $proc.EnableRaisingEvents = $true
+
+    $outSub = Register-ObjectEvent -InputObject $proc -EventName OutputDataReceived -Action {
+        if ($null -ne $Event.SourceEventArgs.Data) { Write-Host "  │ $($Event.SourceEventArgs.Data)" -ForegroundColor Gray }
+    }
+    $errSub = Register-ObjectEvent -InputObject $proc -EventName ErrorDataReceived -Action {
+        if ($null -ne $Event.SourceEventArgs.Data) { Write-Host "  │ $($Event.SourceEventArgs.Data)" -ForegroundColor Red }
+    }
+
+    $proc.Start() | Out-Null
+    $proc.BeginOutputReadLine()
+    $proc.BeginErrorReadLine()
+
+    [PSCustomObject]@{ Process = $proc; Subscriptions = @($outSub, $errSub) }
 }
 '@)
 
     #-- Phase runner (single-quoted: no build-time expansion) ---------------
     $initLines.Add(@'
+function Get-ResultGlyph {
+    param([string]$ResultText)
+    switch -regex ($ResultText) {
+        '\(.*reboot\)$' { '⚠'; break }
+        '^RETRY'        { '⚠'; break }
+        '^OK$'          { '✓'; break }
+        '^Detected$'    { '✓'; break }
+        '^Not detected$'{ '○'; break }
+        '^FAILED$'      { '✗'; break }
+        default         { '•' }
+    }
+}
+
 function Invoke-Phase {
     param(
         [string]$Label,
         [string]$Cmd,
         [int]$ExpectedExit = 0,
-        [switch]$Informational
+        [switch]$Informational,      # wording only: Detected/Not detected vs OK/FAILED
+        [switch]$IsDetection,        # behaviour: capture + label stdout/stderr, apply IME 3-condition rule
+        [switch]$IgnoreReturnCodes,  # Install/Uninstall only: skip the standard return-code table
+        [int]$Step = 0,              # optional "(Step/TotalSteps)" progress tag on the header
+        [int]$TotalSteps = 0
     )
     Write-Host ''
-    Write-Host "  [ $Label ]" -ForegroundColor Cyan
+    $stepTag = if ($TotalSteps -gt 1) { "  ($Step/$TotalSteps)" } else { '' }
+    Write-Host "  [ $Label ]$stepTag" -ForegroundColor Cyan
     Write-Host "  > $Cmd"     -ForegroundColor DarkGray
-    Write-Host ('  ' + ('-' * 58)) -ForegroundColor DarkGray
+    Write-Host ('  ' + ('─' * 58)) -ForegroundColor DarkGray
 
     $tokens     = $Cmd.Trim() -split '\s+', 2
     $firstToken = $tokens[0]
     $argStr     = if ($tokens.Count -gt 1) { $tokens[1] } else { $null }
 
     $phaseStart = [datetime]::UtcNow
+    $stdout     = ''
+    $stderr     = ''
+    $psExe      = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
 
     if ($firstToken -match '\.ps1$') {
-        $psExe  = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
-        $psArgs = [System.Collections.Generic.List[string]]::new()
-        $psArgs.AddRange([string[]]@('-NonInteractive', '-NoProfile', '-File', $firstToken))
-        if ($argStr) { $psArgs.Add($argStr) }
-        $proc = Start-Process -FilePath $psExe -ArgumentList $psArgs -Wait -PassThru -NoNewWindow
-        $ec   = $proc.ExitCode
+        if ($IsDetection) {
+            # Detection script: capture stdout+stderr and label their source explicitly
+            # so it's clear which stream produced the text, and to replicate IME's exact
+            # logic: exit 0 + non-empty stdout + empty stderr = Detected. Any stderr data
+            # → Not detected, even with exit 0 and non-empty stdout.
+            $absScript = if ([System.IO.Path]::IsPathRooted($firstToken)) {
+                $firstToken
+            } else {
+                Join-Path (Get-Location).Path ($firstToken -replace '^\.[\\/]', '')
+            }
+            $psi = [System.Diagnostics.ProcessStartInfo]::new()
+            $psi.FileName               = $psExe
+            $psi.Arguments              = "-NonInteractive -NoProfile -ExecutionPolicy Bypass -File `"$($absScript.Replace('"','\"'))`""
+            if ($argStr) { $psi.Arguments += " $argStr" }
+            $psi.UseShellExecute        = $false
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError  = $true
+            $psi.CreateNoWindow         = $true
+
+            $proc       = [System.Diagnostics.Process]::Start($psi)
+            $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+            $stderrTask = $proc.StandardError.ReadToEndAsync()
+            $proc.WaitForExit()
+            $stdout = $stdoutTask.GetAwaiter().GetResult()
+            $stderr = $stderrTask.GetAwaiter().GetResult()
+            $ec     = $proc.ExitCode
+
+            $scriptName = Split-Path -Leaf $absScript
+            if ($stdout.Trim()) {
+                Write-Host "  ↳ stdout (from $scriptName)" -ForegroundColor DarkCyan
+                $stdout.Trim() -split "`r?`n" | ForEach-Object { Write-Host "  │ $_" -ForegroundColor Gray }
+            }
+            if ($stderr.Trim()) {
+                Write-Host "  ↳ stderr (from $scriptName)" -ForegroundColor DarkRed
+                $stderr.Trim() -split "`r?`n" | ForEach-Object { Write-Host "  │ $_" -ForegroundColor Red }
+            }
+            if (-not $stdout.Trim() -and -not $stderr.Trim()) {
+                Write-Host "  (no stdout or stderr produced by $scriptName)" -ForegroundColor DarkGray
+            }
+        } else {
+            # Install / uninstall .ps1: stream output live, indented to match the rest of the UI.
+            # ProcessStartInfo doesn't inherit the session's current directory, so relative
+            # paths like ".\Script.ps1" must be resolved before being handed to -File.
+            $absScript = if ([System.IO.Path]::IsPathRooted($firstToken)) {
+                $firstToken
+            } else {
+                Join-Path (Get-Location).Path ($firstToken -replace '^\.[\\/]', '')
+            }
+            $psArgs = "-NonInteractive -NoProfile -ExecutionPolicy Bypass -File `"$($absScript.Replace('"','\"'))`""
+            if ($argStr) { $psArgs += " $argStr" }
+            $handle = Start-IndentedProcess -FilePath $psExe -Arguments $psArgs -WorkingDirectory (Get-Location).Path
+            $handle.Process.WaitForExit()
+            $ec = $handle.Process.ExitCode
+            $handle.Subscriptions | ForEach-Object {
+                Unregister-Event -SourceIdentifier $_.Name -ErrorAction SilentlyContinue
+                Remove-Job -Id $_.Id -Force -ErrorAction SilentlyContinue
+            }
+        }
     } else {
         try {
             $absExe = if ([System.IO.Path]::IsPathRooted($firstToken)) {
@@ -607,12 +764,14 @@ function Invoke-Phase {
             } else {
                 Join-Path (Get-Location).Path $firstToken
             }
-            $startArgs = @{ FilePath = $absExe; PassThru = $true; WorkingDirectory = (Get-Location).Path }
-            if ($argStr) { $startArgs['ArgumentList'] = $argStr }
-            $proc = Start-Process @startArgs
-            Wait-ProcessTree -RootPid $proc.Id
-            $proc.WaitForExit(500) | Out-Null
-            $ec = $proc.ExitCode
+            $handle = Start-IndentedProcess -FilePath $absExe -Arguments $argStr -WorkingDirectory (Get-Location).Path
+            Wait-ProcessTree -RootPid $handle.Process.Id
+            $handle.Process.WaitForExit(500) | Out-Null
+            $ec = $handle.Process.ExitCode
+            $handle.Subscriptions | ForEach-Object {
+                Unregister-Event -SourceIdentifier $_.Name -ErrorAction SilentlyContinue
+                Remove-Job -Id $_.Id -Force -ErrorAction SilentlyContinue
+            }
         } catch {
             Write-Host "  ERROR: $_" -ForegroundColor Red
             $ec = -1
@@ -626,24 +785,103 @@ function Invoke-Phase {
         '{0}s' -f [int]$span.TotalSeconds
     }
 
-    Write-Host ('  ' + ('-' * 58)) -ForegroundColor DarkGray
-    if ($Informational) {
+    Write-Host ('  ' + ('─' * 58)) -ForegroundColor DarkGray
+
+    if ($IsDetection) {
+        # Apply IME's three-condition rule regardless of which wording we'll display.
+        $hasStdout   = -not [string]::IsNullOrWhiteSpace($stdout)
+        $hasStderr   = -not [string]::IsNullOrWhiteSpace($stderr)
+        $imeDetected = ($ec -eq 0) -and $hasStdout -and (-not $hasStderr)
+        $rawEc       = $ec
+        # Return the IME-effective code so short-circuit logic and -ExpectedExit both work.
+        $ec          = if ($imeDetected) { 0 } else { 1 }
+
+        if ($Informational) {
+            $resultText = if ($imeDetected) { 'Detected' } else { 'Not detected' }
+            $color      = if ($imeDetected) { 'Cyan' } else { 'DarkYellow' }
+        } else {
+            $success    = ($ec -eq $ExpectedExit)
+            $resultText = if ($success) { 'OK' } else { 'FAILED' }
+            $color      = if ($success) { 'Green' } else { 'Red' }
+        }
+        $glyph = Get-ResultGlyph $resultText
+        Write-Host "  $glyph $resultText  (exit: $rawEc, elapsed: $elapsedStr)  [$Label]" -ForegroundColor $color
+        if (-not $imeDetected -and $rawEc -eq 0) {
+            if (-not $hasStdout) {
+                Write-Host "  [!] exit 0 but no stdout — IME requires Write-Output to signal detection" -ForegroundColor DarkYellow
+            } elseif ($hasStderr) {
+                Write-Host "  [!] stderr present — IME treats any stderr output as not detected" -ForegroundColor DarkYellow
+            }
+        }
+    } elseif ($Informational) {
         $resultText = if ($ec -eq 0) { 'Detected' } else { 'Not detected' }
         $color      = if ($ec -eq 0) { 'Cyan' } else { 'DarkYellow' }
-        Write-Host "  $resultText  (exit: $ec, elapsed: $elapsedStr)  [$Label]" -ForegroundColor $color
+        $glyph      = Get-ResultGlyph $resultText
+        Write-Host "  $glyph $resultText  (exit: $ec, elapsed: $elapsedStr)  [$Label]" -ForegroundColor $color
+    } elseif ($ec -eq $ExpectedExit) {
+        $success    = $true
+        $resultText = 'OK'
+        $color      = 'Green'
+        $glyph      = Get-ResultGlyph $resultText
+        Write-Host "  $glyph $resultText  (exit: $ec, expected: $ExpectedExit, elapsed: $elapsedStr)  [$Label]" -ForegroundColor $color
+    } elseif (-not $IgnoreReturnCodes -and $script:_returnCodes.ContainsKey($ec)) {
+        # Standard Intune Win32 return code — informative only, no reboot/retry is triggered.
+        $category = $script:_returnCodes[$ec]
+        $success  = $true
+        switch ($category) {
+            'Success' {
+                $resultText = 'OK'
+                $color      = 'Green'
+            }
+            'SoftReboot' {
+                $resultText = 'OK (soft reboot)'
+                $color      = 'Yellow'
+            }
+            'HardReboot' {
+                $resultText = 'OK (hard reboot)'
+                $color      = 'Yellow'
+            }
+            'Retry' {
+                $resultText = 'RETRY code'
+                $color      = 'DarkYellow'
+                $success    = $false
+            }
+        }
+        $glyph = Get-ResultGlyph $resultText
+        Write-Host "  $glyph $resultText  (exit: $ec, elapsed: $elapsedStr)  [$Label]" -ForegroundColor $color
+        switch ($category) {
+            'SoftReboot' {
+                Write-Host "  [i] Exit $ec = Soft Reboot" -ForegroundColor DarkGray
+                Write-Host "      IME lets the next app install without reboot; a restart is still needed to finish this one (not triggered here)." -ForegroundColor DarkGray
+            }
+            'HardReboot' {
+                Write-Host "  [i] Exit $ec = Hard Reboot" -ForegroundColor DarkGray
+                Write-Host "      IME blocks the next app install until reboot (not triggered here)." -ForegroundColor DarkGray
+            }
+            'Retry' {
+                Write-Host "  [i] Exit $ec = Retry" -ForegroundColor DarkGray
+                Write-Host "      IME would retry up to 3 times, 5 minutes apart (not retried automatically here)." -ForegroundColor DarkGray
+            }
+            'Success' {
+                Write-Host "  [i] Exit $ec = recognized success code" -ForegroundColor DarkGray
+                Write-Host "      e.g. an MSI 'restart already scheduled' code." -ForegroundColor DarkGray
+            }
+        }
     } else {
-        $success    = ($ec -eq $ExpectedExit)
-        $resultText = if ($success) { 'OK' } else { 'FAILED' }
-        $color      = if ($success) { 'Green' } else { 'Red' }
-        Write-Host "  $resultText  (exit: $ec, expected: $ExpectedExit, elapsed: $elapsedStr)  [$Label]" -ForegroundColor $color
+        $success    = $false
+        $resultText = 'FAILED'
+        $color      = 'Red'
+        $glyph      = Get-ResultGlyph $resultText
+        Write-Host "  $glyph $resultText  (exit: $ec, expected: $ExpectedExit, elapsed: $elapsedStr)  [$Label]" -ForegroundColor $color
     }
 
     $script:_cycleResults += [PSCustomObject]@{
-        Label      = $Label
-        ResultText = $resultText
-        ExitCode   = $ec
-        Elapsed    = $elapsedStr
-        IsOK       = if ($Informational) { $null } else { $success }
+        Label       = $Label
+        ResultText  = $resultText
+        ExitCode    = $ec
+        Elapsed     = $elapsedStr
+        IsOK        = if ($Informational) { $null } else { $success }
+        IsDetection = $IsDetection.IsPresent
     }
 
     return $ec
@@ -652,22 +890,63 @@ function Invoke-Phase {
 
     #-- Looped flow menu (single-quoted: all $vars are runtime) -------------
     $initLines.Add(@'
+function Write-RunHeader {
+    param([int]$RunNumber, [string]$Title, [string]$Time)
+    $width  = try { [Math]::Max(40, [Math]::Min(80, $Host.UI.RawUI.WindowSize.Width - 1)) } catch { 62 }
+    $text   = " Run #$RunNumber " + [char]0x00B7 + " $Title " + [char]0x00B7 + " $Time "
+    $fill   = [Math]::Max(0, $width - 2 - $text.Length)
+    $left   = [int]($fill / 2)
+    $right  = $fill - $left
+    Write-Host ('  ' + ('═' * $left) + $text + ('═' * $right)) -ForegroundColor Magenta
+}
+
 function Show-CycleSummary {
     param([string]$Title, [datetime]$StartTime)
     $ts     = [datetime]::UtcNow - $StartTime
     $total  = if ($ts.TotalMinutes -ge 1) { '{0}m {1:00}s' -f [int]$ts.TotalMinutes, $ts.Seconds } else { '{0}s' -f [int]$ts.TotalSeconds }
+
+    # PadRight never truncates and never adds a gap once the string already fills the
+    # column, so each width must exceed the longest real value by at least 1 character:
+    # "Detection (post-uninstall)" is 26 chars; "OK (soft reboot)"/"OK (hard reboot)" are 16.
+    $colLabel   = 27
+    $colResult  = 17
+    $colElapsed = 7
+    # Row is "  │ $mark $lbl$res$ela  │" — a 6-char prefix (vs. 5 without the mark
+    # column) and a 3-char suffix around the label/result/elapsed content.
+    $innerWidth = $colLabel + $colResult + $colElapsed + 5
+
     $header = "─ $Title ─── $total "
-    $fill   = [Math]::Max(0, 51 - $header.Length)
+    $fill   = [Math]::Max(0, $innerWidth - $header.Length)
     Write-Host ''
     Write-Host "  ┌$header$('─' * $fill)┐" -ForegroundColor DarkCyan
+    $maxSeverity = -1
     foreach ($r in $script:_cycleResults) {
-        $lbl = $r.Label.PadRight(26)
-        $res = $r.ResultText.PadRight(14)
-        $ela = $r.Elapsed.PadLeft(7)
-        $clr = switch ($r.IsOK) { $true { 'Green' } $false { 'Red' } default { 'Cyan' } }
-        Write-Host "  │  $lbl$res$ela  │" -ForegroundColor $clr
+        $mark = if ($r.IsDetection) { '›' } else { '▶' }
+        $lbl  = $r.Label.PadRight($colLabel)
+        $res  = $r.ResultText.PadRight($colResult)
+        $ela  = $r.Elapsed.PadLeft($colElapsed)
+        $clr  = switch ($r.IsOK) { $true { 'Green' } $false { 'Red' } default { 'Cyan' } }
+        Write-Host "  │ $mark $lbl$res$ela  │" -ForegroundColor $clr
+
+        # Severity drives the overall verdict: FAILED > RETRY > reboot-required > clean pass > informational-only.
+        $sev = switch -regex ($r.ResultText) {
+            '^FAILED$'      { 3; break }
+            '^RETRY'        { 2; break }
+            '\(.*reboot\)$' { 1; break }
+            default         { if ($null -eq $r.IsOK) { -1 } else { 0 } }
+        }
+        if ($sev -gt $maxSeverity) { $maxSeverity = $sev }
     }
-    Write-Host "  └$('─' * 51)┘" -ForegroundColor DarkCyan
+    Write-Host "  └$('─' * $innerWidth)┘" -ForegroundColor DarkCyan
+
+    $verdictText, $verdictColor = switch ($maxSeverity) {
+        3       { 'FAILED',          'Red';        break }
+        2       { 'RETRY REQUIRED',  'DarkYellow'; break }
+        1       { 'REBOOT REQUIRED', 'Yellow';     break }
+        0       { 'PASSED',          'Green';      break }
+        default { 'SKIPPED',         'DarkGray' }
+    }
+    Write-Host "  Result: $verdictText" -ForegroundColor $verdictColor
     Write-Host ''
 }
 
@@ -696,40 +975,40 @@ while ($true) {
 
     switch ($choice.Trim()) {
         '1' {
-            Write-Host "  ════ Run #$($script:_runCount) · Install Cycle · $cycleTime ════════════════" -ForegroundColor Magenta
-            $preEc = Invoke-Phase 'Detection (pre-install)' $script:_dr -Informational
+            Write-RunHeader $script:_runCount 'Install Cycle' $cycleTime
+            $preEc = Invoke-Phase 'Detection (pre-install)' $script:_dr -Informational -IsDetection -Step 1 -TotalSteps 3
             if ($preEc -eq 0) {
                 Write-Host ''
                 Write-Host '  [~] App already detected — install skipped.' -ForegroundColor Yellow
             } else {
-                Invoke-Phase 'Install' $script:_ic
-                Invoke-Phase 'Detection (post-install)' $script:_dr
+                $null = Invoke-Phase 'Install' $script:_ic -IgnoreReturnCodes:$script:_ignoreReturnCodes -Step 2 -TotalSteps 3
+                $null = Invoke-Phase 'Detection (post-install)' $script:_dr -IsDetection -Step 3 -TotalSteps 3
             }
             Show-CycleSummary 'Install Cycle' $cycleStart
         }
         '2' {
-            Write-Host "  ════ Run #$($script:_runCount) · Uninstall Cycle · $cycleTime ══════════════" -ForegroundColor Magenta
-            $preEc = Invoke-Phase 'Detection (pre-uninstall)' $script:_dr -Informational
+            Write-RunHeader $script:_runCount 'Uninstall Cycle' $cycleTime
+            $preEc = Invoke-Phase 'Detection (pre-uninstall)' $script:_dr -Informational -IsDetection -Step 1 -TotalSteps 3
             if ($preEc -ne 0) {
                 Write-Host ''
                 Write-Host '  [~] App not detected — uninstall skipped.' -ForegroundColor Yellow
             } else {
-                Invoke-Phase 'Uninstall' $script:_uc
-                Invoke-Phase 'Detection (post-uninstall)' $script:_dr -ExpectedExit 1
+                $null = Invoke-Phase 'Uninstall' $script:_uc -IgnoreReturnCodes:$script:_ignoreReturnCodes -Step 2 -TotalSteps 3
+                $null = Invoke-Phase 'Detection (post-uninstall)' $script:_dr -ExpectedExit 1 -IsDetection -Step 3 -TotalSteps 3
             }
             Show-CycleSummary 'Uninstall Cycle' $cycleStart
         }
         '3' {
-            Write-Host "  ════ Run #$($script:_runCount) · Detection Only · $cycleTime ════════════════" -ForegroundColor Magenta
-            Invoke-Phase 'Detection' $script:_dr -Informational
+            Write-RunHeader $script:_runCount 'Detection Only' $cycleTime
+            $null = Invoke-Phase 'Detection' $script:_dr -Informational -IsDetection
         }
         '4' {
-            Write-Host "  ════ Run #$($script:_runCount) · Install Only · $cycleTime ══════════════════" -ForegroundColor Magenta
-            Invoke-Phase 'Install' $script:_ic
+            Write-RunHeader $script:_runCount 'Install Only' $cycleTime
+            $null = Invoke-Phase 'Install' $script:_ic -IgnoreReturnCodes:$script:_ignoreReturnCodes
         }
         '5' {
-            Write-Host "  ════ Run #$($script:_runCount) · Uninstall Only · $cycleTime ════════════════" -ForegroundColor Magenta
-            Invoke-Phase 'Uninstall' $script:_uc
+            Write-RunHeader $script:_runCount 'Uninstall Only' $cycleTime
+            $null = Invoke-Phase 'Uninstall' $script:_uc -IgnoreReturnCodes:$script:_ignoreReturnCodes
         }
         default {
             Write-Host "  [!] Invalid choice: '$choice'" -ForegroundColor Red
@@ -753,9 +1032,13 @@ if ($ScriptBlock -ne '') {
     $initLines.Add($ScriptBlock)
 }
 
-# Encode as UTF-16LE Base64 for -EncodedCommand
+# Write init script to a temp file — avoids the Windows 32 KB command-line limit
+# that -EncodedCommand hits once the script grows large enough.
+# The script deletes itself on first run via $PSCommandPath.
+$initLines.Insert(0, 'Remove-Item -LiteralPath $PSCommandPath -ErrorAction SilentlyContinue')
 $initScript = $initLines -join "`n"
-$encodedCmd = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($initScript))
+$tempInit   = Join-Path $env:TEMP "intunewin_init_$([System.Guid]::NewGuid().ToString('N').Substring(0,8)).ps1"
+[System.IO.File]::WriteAllText($tempInit, $initScript, [System.Text.Encoding]::UTF8)
 
 $shell    = if (Get-Command 'pwsh' -ErrorAction SilentlyContinue) { 'pwsh' } else { 'powershell' }
 $isSystem = $appConfig -and ($appConfig.install_type -eq 'system')
@@ -821,11 +1104,11 @@ if ($isSystem) {
     # -d          : don't wait for the child process to exit (return immediately)
     Start-Process -FilePath $psexec -ArgumentList @(
         '-accepteula', '-s', '-i', '-d',
-        $shell, '-NoExit', '-EncodedCommand', $encodedCmd
+        $shell, '-NoExit', '-ExecutionPolicy', 'Bypass', '-File', $tempInit
     )
 
 } else {
-    Start-Process -FilePath $shell -ArgumentList @('-NoExit', '-EncodedCommand', $encodedCmd)
+    Start-Process -FilePath $shell -ArgumentList @('-NoExit', '-ExecutionPolicy', 'Bypass', '-File', $tempInit)
 }
 
 Write-OK "New $shell window launched."
