@@ -12,7 +12,7 @@ A PowerShell utility for decoding `.intunewin` packages and running install, uni
 ## Usage
 
 ```powershell
-.\Invoke-IntuneWinTester.ps1 -IntuneWinFile <path> [-ConfigFile <path>] [-ExtractPath <dir>] [-PsExecPath <path>] [-Force]
+.\Invoke-IntuneWinTester.ps1 -IntuneWinFile <path> [-ConfigFile <path>] [-ExtractPath <dir>] [-PsExecPath <path>] [-ScriptBlock <string>] [-Force]
 ```
 
 ### Parameters
@@ -23,6 +23,7 @@ A PowerShell utility for decoding `.intunewin` packages and running install, uni
 | `-ConfigFile` | No | Path to the app JSON config file (enables interactive flow menu) |
 | `-ExtractPath` | No | Root directory for extraction. When supplied, contents are placed in `<ExtractPath>\<basename>`. Defaults to `<intunewin dir>\<basename>_decoded` |
 | `-PsExecPath` | No | Path to `psexec.exe` or `PsExec64.exe`. Required only when `install_type` is `system` and PsExec is not next to the script or on `PATH` |
+| `-ScriptBlock` | No | Script content (as a string) to run in the new window after it opens. The window stays open (`-NoExit`) once it finishes |
 | `-Force` | No | Re-decrypt even if the source file hash matches the cached hash |
 
 ## Quick start
@@ -134,7 +135,7 @@ After a successful extraction the SHA-256 hash of the `.intunewin` source file i
 When `install_type` is `system` the script:
 
 1. Verifies it is running as Administrator (exits with an error if not).
-2. Locates PsExec (next to the script → PATH → `-PsExecPath`).
+2. Locates PsExec (`-PsExecPath` → next to the script → PATH).
 3. Launches the child window using `psexec -accepteula -s -i -d`, which runs the PowerShell session as the `SYSTEM` account.
 
 ```powershell
