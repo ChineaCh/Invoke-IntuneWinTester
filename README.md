@@ -12,7 +12,7 @@ A PowerShell utility for decoding `.intunewin` packages and running install, uni
 ## Usage
 
 ```powershell
-.\Invoke-IntuneWinTester.ps1 -IntuneWinFile <path> [-ConfigFile <path>] [-ExtractPath <dir>] [-PsExecPath <path>] [-Force] [-IgnoreReturnCodes]
+.\Invoke-IntuneWinTester.ps1 -IntuneWinFile <path> [-ConfigFile <path>] [-ExtractPath <dir>] [-PsExecPath <path>] [-ScriptBlock <string>] [-Force] [-IgnoreReturnCodes]
 ```
 
 ### Parameters
@@ -24,8 +24,8 @@ A PowerShell utility for decoding `.intunewin` packages and running install, uni
 | `-ExtractPath` | No | Root directory for extraction. When supplied, contents are placed in `<ExtractPath>\<basename>`. Defaults to `<intunewin dir>\<basename>_decoded` |
 | `-PsExecPath` | No | Path to `psexec.exe` or `PsExec64.exe`. Required only when `install_type` is `system` and PsExec is not next to the script or on `PATH` |
 | `-Force` | No | Re-decrypt even if the source file hash matches the cached hash |
-| `-IgnoreReturnCodes` | No | Disable the standard Intune Win32 return-code table for Install/Uninstall and compare strictly against `-ExpectedExit` (default `0`) instead |
-| `-ScriptBlock` | No | Script block content (as a string) to run in the new window, appended after the flow menu closes |
+| `-IgnoreReturnCodes` | No | Disable the standard Intune Win32 return-code table for Install/Uninstall and require an exact match against the internal expected exit code (`0`) instead |
+| `-ScriptBlock` | No | Script content (as a string) to run in the new window after it opens. The window stays open (`-NoExit`) once it finishes |
 
 ## Quick start
 
@@ -116,7 +116,7 @@ By default, Install and Uninstall results are classified using the same return c
 | `1618` | Retry | `RETRY code` — IME would retry up to 3 times, 5 minutes apart |
 | anything else | — | `FAILED` |
 
-None of these trigger an actual reboot or retry in this tester — they're informative only. Pass `-IgnoreReturnCodes` to disable the table and require an exact match against `-ExpectedExit` instead.
+None of these trigger an actual reboot or retry in this tester — they're informative only. Pass `-IgnoreReturnCodes` to disable the table; results are then `OK` only on an exact match against the internal expected exit code (`0` for Install/Uninstall) and `FAILED` otherwise.
 
 ## Interactive flow menu
 
@@ -157,7 +157,9 @@ Install/uninstall output streams live to the console as it happens, indented wit
 
 ### Process tree waiting
 
-After launching the installer or uninstaller the tester polls WMI (`Win32_Process`) every 2 seconds and waits until the **entire process tree** exits — including child processes spawned by the installer (e.g. PSADT's `Deploy-Application.exe` launching `powershell.exe` and exiting early). A live spinner shows running process names and elapsed time while waiting.
+For `.exe`-based install/uninstall commands, the tester polls WMI (`Win32_Process`) every 2 seconds and waits until the **entire process tree** exits — including child processes spawned by the installer (e.g. PSADT's `Deploy-Application.exe` launching `powershell.exe` and exiting early). A live spinner shows running process names and elapsed time while waiting.
+
+If `install_command`/`uninstall_command` instead points at a `.ps1` script, this process-tree wait does not apply — the tester only waits for that PowerShell process itself to exit.
 
 ## Caching
 
@@ -172,7 +174,7 @@ After a successful extraction the SHA-256 hash of the `.intunewin` source file i
 When `install_type` is `system` the script:
 
 1. Verifies it is running as Administrator (exits with an error if not).
-2. Locates PsExec (next to the script → PATH → `-PsExecPath`).
+2. Locates PsExec (`-PsExecPath` → next to the script → PATH).
 3. Launches the child window using `psexec -accepteula -s -i -d`, which runs the PowerShell session as the `SYSTEM` account.
 
 ```powershell
