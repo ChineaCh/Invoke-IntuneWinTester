@@ -54,6 +54,11 @@
 .EXAMPLE
     .\Invoke-IntuneWinTester.ps1 -IntuneWinFile .\MyApp.intunewin -Force
 
+.PARAMETER UsePwsh
+    Open the test window in PowerShell 7 (pwsh) instead of Windows PowerShell 5.1.
+    The default is 5.1 because that is what Intune and PSADT's Deploy-Application.exe use;
+    PSADT 3.8.x is not compatible with PowerShell 7 (e.g. Execute-ProcessAsUser fails).
+
 .PARAMETER PsExecPath
     Path to psexec.exe / PsExec64.exe. Only needed when install_type is 'system'.
     If omitted the script looks for PsExec64.exe or psexec.exe next to itself, then
@@ -92,7 +97,10 @@ param(
     [switch]$Force,
 
     [Parameter(Mandatory = $false)]
-    [switch]$IgnoreReturnCodes
+    [switch]$IgnoreReturnCodes,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$UsePwsh
 )
 
 Set-StrictMode -Version Latest
@@ -541,6 +549,7 @@ if ($appConfig) {
     $initLines.Add("Write-Host ('─' * 62) -ForegroundColor DarkCyan")
     $initLines.Add("Write-Host '  $dn' -ForegroundColor White")
     $initLines.Add("Write-Host ('─' * 62) -ForegroundColor DarkCyan")
+    $initLines.Add('Write-Host ("  PowerShell   : {0} {1}" -f $PSVersionTable.PSEdition, $PSVersionTable.PSVersion) -ForegroundColor Gray')
     if ($pub)     { $initLines.Add("Write-Host '  Publisher    : $pub' -ForegroundColor Gray") }
     if ($ver)     { $initLines.Add("Write-Host '  Version      : $ver' -ForegroundColor Gray") }
     if ($it -eq 'system') {
@@ -1049,7 +1058,9 @@ $initScript = $initLines -join "`n"
 $tempInit   = Join-Path $env:TEMP "intunewin_init_$([System.Guid]::NewGuid().ToString('N').Substring(0,8)).ps1"
 [System.IO.File]::WriteAllText($tempInit, $initScript, [System.Text.Encoding]::UTF8)
 
-$shell    = if (Get-Command 'pwsh' -ErrorAction SilentlyContinue) { 'pwsh' } else { 'powershell' }
+# Default to Windows PowerShell 5.1 (what Intune / Deploy-Application.exe use); pwsh only on request.
+$ps51     = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+$shell    = if ($UsePwsh -and (Get-Command 'pwsh' -ErrorAction SilentlyContinue)) { 'pwsh' } else { $ps51 }
 $isSystem = $appConfig -and ($appConfig.install_type -eq 'system')
 
 if ($isSystem) {
@@ -1120,7 +1131,7 @@ if ($isSystem) {
     Start-Process -FilePath $shell -ArgumentList @('-NoExit', '-ExecutionPolicy', 'Bypass', '-File', $tempInit)
 }
 
-Write-OK "New $shell window launched."
+Write-OK "New $(Split-Path $shell -Leaf) window launched."
 Write-Host ''
 Write-Host "  Extracted path : $ExtractPath" -ForegroundColor Yellow
 if ($appConfig) {
