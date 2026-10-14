@@ -382,10 +382,19 @@ if ($needsDecode) {
         if ($zipOffset -gt 0) {
             Write-Skip "ZIP magic found at byte offset $zipOffset — trimming $zipOffset-byte prefix."
             # Rewrite the file without the prefix so ZipArchive can seek normally
-            $allBytes   = [System.IO.File]::ReadAllBytes($decryptedZip)
-            $trimmed    = $allBytes[$zipOffset..($allBytes.Length - 1)]
-            [System.IO.File]::WriteAllBytes($decryptedZip, $trimmed)
-            Remove-Variable allBytes, trimmed
+            # Stream into a temp file (a PowerShell array slice over a large file is extremely slow)
+            $trimmedPath = "$decryptedZip.trim"
+            $srcFs = [System.IO.File]::OpenRead($decryptedZip)
+            $dstFs = [System.IO.File]::Create($trimmedPath)
+            try {
+                $srcFs.Seek($zipOffset, [System.IO.SeekOrigin]::Begin) | Out-Null
+                $srcFs.CopyTo($dstFs, 1MB)
+            }
+            finally {
+                $dstFs.Dispose()
+                $srcFs.Dispose()
+            }
+            Move-Item -LiteralPath $trimmedPath -Destination $decryptedZip -Force
         }
         else {
             Write-Fail "ZIP magic (PK) not found in first 64 bytes of decrypted output. Decryption may have used the wrong key or IV."
