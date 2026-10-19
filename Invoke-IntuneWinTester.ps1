@@ -78,8 +78,8 @@
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true, Position = 0)]
-    [string]$IntuneWinFile,
+    [Parameter(Mandatory = $false, Position = 0)]
+    [string]$IntuneWinFile = '',
 
     [Parameter(Mandatory = $false)]
     [string]$ScriptBlock = '',
@@ -105,6 +105,42 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+#region ── File pickers (no -IntuneWinFile supplied) ────────────────────────────
+
+if (-not $IntuneWinFile) {
+    Add-Type -AssemblyName System.Windows.Forms
+
+    function Show-OpenFilePicker {
+        param([string]$Title, [string]$Filter)
+        $dlg = New-Object System.Windows.Forms.OpenFileDialog
+        $dlg.Title            = $Title
+        $dlg.Filter           = $Filter
+        $dlg.FilterIndex      = 1
+        $dlg.CheckFileExists  = $true
+        $dlg.Multiselect      = $false
+        $dlg.InitialDirectory = (Get-Location).Path
+        try {
+            if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { return $dlg.FileName }
+            return ''
+        }
+        finally { $dlg.Dispose() }
+    }
+
+    $IntuneWinFile = Show-OpenFilePicker -Title 'Select the .intunewin package' `
+        -Filter 'Intune package (*.intunewin)|*.intunewin|All files (*.*)|*.*'
+    if (-not $IntuneWinFile) {
+        Write-Host 'No .intunewin file selected. Exiting.' -ForegroundColor Yellow
+        return
+    }
+
+    if (-not $ConfigFile) {
+        $ConfigFile = Show-OpenFilePicker -Title 'Select the config file (Cancel to skip)' `
+            -Filter 'JSON config (*.json)|*.json|All files (*.*)|*.*'
+    }
+}
+
+#endregion
 
 #region ── Helpers ──────────────────────────────────────────────────────────────
 
