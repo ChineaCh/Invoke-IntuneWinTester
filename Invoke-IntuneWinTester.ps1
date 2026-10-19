@@ -114,6 +114,11 @@ if (-not $IntuneWinFile) {
     }
     Add-Type -AssemblyName System.Windows.Forms
 
+    Write-Host ''
+    Write-Host '[*] No -IntuneWinFile supplied, so file pickers will be shown.' -ForegroundColor Cyan
+    Write-Host '    Expected: pick the .intunewin package, then (optionally) its JSON config file.' -ForegroundColor Gray
+    Write-Host '    Tip: pass -IntuneWinFile <path> [-ConfigFile <path>] to skip the pickers.' -ForegroundColor Gray
+
     function Show-OpenFilePicker {
         param([string]$Title, [string]$Filter)
         $dlg = New-Object System.Windows.Forms.OpenFileDialog
@@ -138,17 +143,26 @@ if (-not $IntuneWinFile) {
         finally { $owner.Dispose(); $dlg.Dispose() }
     }
 
+    Write-Host '[*] Opening picker: select the .intunewin package...' -ForegroundColor Cyan
     $IntuneWinFile = Show-OpenFilePicker -Title 'Select the .intunewin package' `
         -Filter 'Intune package (*.intunewin)|*.intunewin|All files (*.*)|*.*'
     if (-not $IntuneWinFile) {
-        Write-Host 'No .intunewin file selected. Exiting.' -ForegroundColor Yellow
+        Write-Host '[!] No .intunewin file selected. Nothing to do, exiting.' -ForegroundColor Yellow
         return
     }
+    Write-Host "[+] Package selected: $IntuneWinFile" -ForegroundColor Green
 
     if (-not $ConfigFile) {
+        Write-Host '[*] Opening picker: select the JSON config file (Cancel to skip)...' -ForegroundColor Cyan
         $ConfigFile = Show-OpenFilePicker -Title 'Select the config file (Cancel to skip)' `
             -Filter 'JSON config (*.json)|*.json|All files (*.*)|*.*'
+        if ($ConfigFile) {
+            Write-Host "[+] Config selected : $ConfigFile" -ForegroundColor Green
+        } else {
+            Write-Host '[~] No config selected. Continuing without one (plain window, no install/uninstall menu).' -ForegroundColor DarkCyan
+        }
     }
+    Write-Host ''
 }
 
 #endregion
