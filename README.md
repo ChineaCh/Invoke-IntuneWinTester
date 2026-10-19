@@ -19,7 +19,7 @@ A PowerShell utility for decoding `.intunewin` packages and running install, uni
 
 | Parameter | Required | Description |
 |---|---|---|
-| `-IntuneWinFile` | Yes | Path to the `.intunewin` file to decode |
+| `-IntuneWinFile` | No | Path to the `.intunewin` file to decode. If omitted, a file picker (filtered to `*.intunewin`) opens, followed by a second picker for the config file (Cancel to skip) |
 | `-ConfigFile` | No | Path to the app JSON config file (enables the interactive flow menu) |
 | `-ExtractPath` | No | Root directory for extraction. When supplied, contents are placed in `<ExtractPath>\<basename>`. Defaults to `<intunewin dir>\<basename>_decoded` |
 | `-PsExecPath` | No | Path to `psexec.exe` or `PsExec64.exe`. Required only when `install_type` is `system` and PsExec is not next to the script or on `PATH` |
