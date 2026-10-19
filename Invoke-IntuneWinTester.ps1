@@ -109,6 +109,9 @@ $ErrorActionPreference = 'Stop'
 #region ── File pickers (no -IntuneWinFile supplied) ────────────────────────────
 
 if (-not $IntuneWinFile) {
+    if (-not [Environment]::UserInteractive) {
+        throw 'No -IntuneWinFile supplied and the session is not interactive, so the file picker cannot be shown.'
+    }
     Add-Type -AssemblyName System.Windows.Forms
 
     function Show-OpenFilePicker {
@@ -120,11 +123,19 @@ if (-not $IntuneWinFile) {
         $dlg.CheckFileExists  = $true
         $dlg.Multiselect      = $false
         $dlg.InitialDirectory = (Get-Location).Path
+        # Hidden topmost owner so the dialog opens in front of the console window
+        $owner = New-Object System.Windows.Forms.Form
+        $owner.TopMost       = $true
+        $owner.ShowInTaskbar = $false
+        $owner.Opacity       = 0
+        $owner.StartPosition = 'CenterScreen'
         try {
-            if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { return $dlg.FileName }
+            $owner.Show()
+            $owner.Activate()
+            if ($dlg.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) { return $dlg.FileName }
             return ''
         }
-        finally { $dlg.Dispose() }
+        finally { $owner.Dispose(); $dlg.Dispose() }
     }
 
     $IntuneWinFile = Show-OpenFilePicker -Title 'Select the .intunewin package' `
